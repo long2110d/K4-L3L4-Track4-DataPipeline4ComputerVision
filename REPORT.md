@@ -21,7 +21,15 @@
 ### Câu 1
 Liệt kê **ít nhất 4 khác biệt** giữa telemetry nguồn A và nguồn B mà bạn thấy ở bronze. Vì sao pipeline giữ **mỗi nguồn một bảng bronze** và để mọi cột ở dạng chữ, thay vì gộp và ép kiểu ngay?
 
-(trả lời ở đây)
+Khác biệt A (`raw_telemetry_a`, 3021 dòng) và B (`raw_telemetry_b`, 3234 dòng) thấy ở bronze:
+
+1. **Tên cột**: A dùng `ts_utc, speed_mps, heading_deg, lat, lon, alt_m, acc_x, acc_y, gas, brake, steer`; B dùng `timestamp_ms, spd_kmh, hdg, latitude, longitude, altitude, ax, ay, throttle_pct, brake_pct, steering`.
+2. **Đơn vị tốc độ**: A là m/s (`1.213`), B là km/h (`55.11`).
+3. **Kiểu thời gian**: A là chuỗi ISO UTC (`2025-10-07T08:00:00.014Z`), B là epoch mili-giây (`1759933801509`).
+4. **Bàn đạp**: A là tỷ lệ 0–1 (`gas=0.028`), B là phần trăm (`throttle_pct=2.0`).
+5. **Đồng hồ**: B chạy lệch so với video, `bronze_video_files` ghi `telemetry_clock_offset_ms = 1500` cho drive_b, 0 cho drive_a.
+
+Mỗi nguồn một bảng vì hai schema khác nhau: gộp ngay thì phải quyết định cách đổi đơn vị/thời gian ở tầng ingest, và nếu đổi sai thì bản gốc đã mất. Để mọi cột là chữ thì ingest **không bao giờ thất bại** vì một ô xấu (ô trống, `"abc"`, số vô lý) và bronze giữ **đúng nguyên bản** để chạy lại silver khi sửa luật. Việc ép kiểu, đổi đơn vị, loại dòng lỗi dồn về silver, nơi có test. Nạp lại lần hai báo `already present` (nhận diện bằng sha256), và `cli history bronze.raw_telemetry_a` chỉ có **1 commit** (`WRITE`, `rows_added: 3021`): bronze idempotent.
 
 ## Bước 2 · Silver telemetry
 
