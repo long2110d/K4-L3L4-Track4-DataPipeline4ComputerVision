@@ -83,17 +83,33 @@ Ngưỡng trùng (`threshold.json`): 0 bit → A 61, B 8; 2 bit (đang dùng) �
 ### Câu 6
 Dựa vào `leakage.json`: chia theo khung hình làm bao nhiêu trip bị chia cắt, so với chia theo trip? Vì sao điều này làm điểm kiểm thử đẹp một cách giả tạo?
 
-(trả lời ở đây)
+`leakage.json`: 1019 khung hợp lệ thuộc 26 trip. Chia **theo khung hình** (ngẫu nhiên 70/15/15): **26/26 trip** bị chia cắt qua nhiều split, và **cả 26 trip** có khung ở cả train lẫn test. Chia **theo trip** (gold của pipeline): **0 trip** bị chia cắt; dataset của tôi có 18 trip train, 4 val, 4 test.
+
+Lấy mẫu 2 khung/giây nên hai khung liền nhau cách 0,5 s gần như cùng một cảnh: cùng con đường, cùng xe phía trước, cùng ánh sáng, thời tiết. Chia theo khung thì với mỗi khung test gần như luôn có một "anh em sinh đôi" trong train, mô hình chỉ cần **nhớ** cảnh chứ không cần **tổng quát hoá**. Điểm test vì thế đo khả năng nhận lại cảnh đã thấy, cao giả tạo; khi gặp đường mới thật sự thì sụt mạnh. Chia theo trip bảo đảm test là những cảnh mô hình **chưa từng thấy**, giống tình huống triển khai thật.
 
 ### Câu 7
 Vì sao `dataset_version` là **băm nội dung** chứ không phải ngày giờ hay số đếm? Hai lần chạy liên tiếp cho kết quả gì? Vì sao `dataset_version` của bạn **khác** bạn bè dù cùng dữ liệu (liên hệ MSSV)?
 
-(trả lời ở đây)
+`dataset_version` = 12 ký tự đầu của `sha256` trên danh sách `frame_id|split` đã sắp xếp (`pipeline/publish.py`, `export_dataset`). Nó **đặt tên theo nội dung**: cùng tập khung và cùng cách chia thì cùng tên, khác một khung hoặc một khung đổi split thì khác tên. Ngày giờ hay số đếm thì chạy lại cùng dữ liệu vẫn ra tên mới (không biết hai bản có giống nhau không), và hai bản khác nhau có thể trùng tên trên hai máy. Băm nội dung giúp so sánh, cache, và tái lập: một kết quả huấn luyện ghi `fb6509ec3b13` là chỉ đúng một tập dữ liệu.
+
+Hai lần chạy liên tiếp: `step 4` rồi `cli export-dataset` đều ra **`fb6509ec3b13`**, cùng `manifest_sha256 = 0652d728…`, dù `created_at` khác nhau, và `step all --reset` từ lake trống cũng ra `fb6509ec3b13`.
+
+MSSV được trộn vào thứ tự xếp trip: `gold_dataset_frames.sql` sắp trip trong mỗi drive theo `md5(trip_id || LAB_STUDENT_ID)` rồi cắt 70%/15%/15%. Đổi MSSV thì thứ tự đổi → trip nào vào train/val/test đổi → số khung mỗi split đổi → version đổi. Tôi thử đổi sang `2024000`: version thành **`8fc131884584`**, split 703/182/134 (của tôi `2A202602673`: 786/108/125); vẫn 18/4/4 trip vì tỷ lệ chia theo số trip. Đặt lại MSSV của tôi thì về đúng `fb6509ec3b13`. Tập khung hình không đổi (1019), chỉ cách chia đổi.
 
 ### Câu 8
 Đọc phần `lineage` trong `manifest.json` của dataset bạn. Trả lời "dataset này được tạo từ dữ liệu nào?" bằng chính nội dung đó. Nếu một người hỏi 3 tháng sau, thông tin nào giúp tái tạo lại đúng dataset này?
 
-(trả lời ở đây)
+`lake/gold/datasets/fb6509ec3b13/manifest.json`, phần `lineage` (lần chạy `step 4` sau thí nghiệm idempotent):
+
+```json
+"bronze.raw_telemetry_a": 0, "bronze.raw_telemetry_b": 0, "bronze.trips_raw": 0, "bronze.video_files": 1,
+"silver.frames": 27, "silver.telemetry": 0, "silver.frames_flagged": 0, "silver.frame_telemetry": 0,
+"input_video_sha256": {"drive_a": "636ba1a9…5e7e9aa", "drive_b": "bfa62703…bbee9fdc"}
+```
+
+Trả lời "dataset này được tạo từ dữ liệu nào?": từ **hai video** có sha256 `636ba1a9…` (drive_a) và `bfa62703…` (drive_b); từ **phiên bản Delta** cụ thể của từng bảng trung gian: telemetry thô A/B version 0, `silver.frames` **version 27** (con số lớn vì 26 partition trip được ghi riêng, cộng 2 lần chạy lại `trip-00003` trong thí nghiệm idempotent), các bảng silver dbt version 0. Manifest còn ghi `rules` (bỏ `is_black, is_blurry, is_near_dup, not sync_ok`; split "per trip, stratified by drive, md5 order"), `by_split` 786/108/125, `by_drive` A 436 / B 583, và `manifest_sha256`.
+
+Ba tháng sau, để tái tạo đúng dataset: (1) `dataset_version` + `manifest.parquet` liệt kê chính xác từng `frame_id`, split, đường dẫn ảnh; (2) các phiên bản Delta trong `lineage` cho phép **time travel** đọc lại đúng trạng thái bảng lúc đó; (3) sha256 video để kiểm tra file gốc còn nguyên; (4) commit git của mã/`dbt_project.yml` (ngưỡng `dark_luma`, `dup_hamming`, `sync_tol_ms`…) và **MSSV** dùng làm salt cho split. Manifest chưa ghi commit git và các tham số ngưỡng, đó là điểm nên bổ sung.
 
 ## Bước 5 · Điều phối và phục vụ
 
