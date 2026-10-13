@@ -36,12 +36,25 @@ Mỗi nguồn một bảng vì hai schema khác nhau: gộp ngay thì phải quy
 ### Câu 2
 Pipeline đưa hai nguồn về một schema như thế nào (đơn vị, kiểu thời gian, **độ lệch đồng hồ**)? Bằng chứng nào trong kết quả bước 2 cho thấy đã đúng? Dán bảng quarantine của bạn (số dòng theo từng lý do, từng drive) và giải thích vì sao dòng lỗi vào `rejects` thay vì bị xoá.
 
-(trả lời ở đây)
+Hai model staging đưa cả hai nguồn về **cùng cột, m/s, `timestamptz` UTC**:
+- `stg_telemetry_a`: chỉ ép kiểu (`ts_utc` → `timestamptz`, tốc độ đã là m/s).
+- `stg_telemetry_b`: đổi tên cột, `spd_kmh / 3.6` → m/s, `throttle_pct/100`, `brake_pct/100` → 0–1, và `to_timestamp((timestamp_ms − offset_ms)/1000)`, trong đó `offset_ms = 1500` lấy từ `bronze.video_files` (khai báo trong `sources.json`), tức là **trừ độ lệch đồng hồ** bằng một join, không viết cứng.
+
+Bằng chứng: sau chuẩn hoá `bat_dau` của B là `2025-10-08 14:30:00.009`, khớp giờ bắt đầu video `14:30:00` (chưa trừ thì sẽ là `14:30:01.509`); verify module 2 báo "first sample within 0.5 s of video start". Tốc độ tối đa sau đổi đơn vị hợp lý: A 71 km/h, B 100 km/h. Kết quả: silver 6149 dòng sạch (A 2968, B 3181), 106 dòng cách ly.
+
+| drive | duplicate | speed_missing | speed_out_of_range | sạch + cách ly = nhận |
+|---|---|---|---|---|
+| drive_a | 20 | 30 | 3 | 2968 + 53 = 3021 |
+| drive_b | 20 | 30 | 3 | 3181 + 53 = 3234 |
+
+Dòng lỗi vào `silver_telemetry_rejects` kèm `reject_reason` chứ không bị xoá để **kiểm toán được**: đếm được `sạch + cách ly = nhận về` (không mất dòng im lặng), biết nguồn nào/cảm biến nào hỏng nhiều, và nếu luật sai (ví dụ ngưỡng tốc độ quá chặt) thì sửa luật rồi chạy lại để lấy dòng đó về, không phải nạp lại từ nguồn.
 
 ### Câu 3
 Vì sao test `max_gap_ms` là `warn` còn `in_range` là `error`? Kết quả thí nghiệm `break-gate` của bạn (`break_gate.json`): test nào bắt được, bao nhiêu dòng, và điều đó cho biết gì về vai trò của "cổng chất lượng"?
 
-(trả lời ở đây)
+`max_gap_ms` (ngưỡng 1000 ms, `severity: warn` trong `dbt/models/schema.yml`) đo **khoảng mất tín hiệu** giữa hai mẫu telemetry. Mất tín hiệu là hiện tượng thật của cảm biến (của tôi: mỗi drive có 1 khoảng > 1 s, dài nhất A 3073 ms, B 3124 ms); dữ liệu còn lại vẫn đúng, và khung hình rơi vào khoảng đó sẽ bị loại ở bước join (`sync_tol_ms = 150`). Nên chỉ **báo** để người vận hành biết, không dừng cả pipeline. `in_range` (tốc độ 0–70 m/s, mặc định `error`) kiểm tra một **bất biến**: tốc độ > 70 m/s (252 km/h) là vô lý về vật lý, nếu lọt vào silver thì nghĩa là luật làm sạch đã hỏng, dữ liệu sai sẽ đi vào dataset huấn luyện, nên phải **dừng**.
+
+Thí nghiệm `break-gate` (`break_gate.json`): nới `max_speed_mps` từ 70 lên 1000 → `dbt test` ra `PASS=5 WARN=1 ERROR=1`, test `in_range_silver_telemetry_speed_mps__70__0` bắt được **6 dòng** (đúng 3 + 3 dòng `speed_out_of_range` của hai drive lẽ ra phải bị cách ly). Khôi phục luật: `PASS=6 WARN=1 ERROR=0`. Ý nghĩa: luật làm sạch và test là **hai lớp độc lập**; khi lớp làm sạch bị nới (lỗi cấu hình, ai đó sửa nhầm), cổng chất lượng vẫn chặn được và trong Airflow các task sau `dbt_test` sẽ không chạy, dữ liệu xấu không đi tiếp xuống gold.
 
 ## Bước 3 · Silver frames
 
