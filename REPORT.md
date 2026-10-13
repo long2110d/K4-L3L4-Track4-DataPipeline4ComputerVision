@@ -61,18 +61,22 @@ Thí nghiệm `break-gate` (`break_gate.json`): nới `max_speed_mps` từ 70 l�
 ### Câu 4
 Dựa vào `idempotency.json`: số dòng trước và sau hai lần chạy lại, và khi ghi kiểu `append`. Vì sao Delta `overwrite` theo partition (một trip) an toàn hơn xoá rồi ghi lại, nhất là khi giữa chừng có lỗi?
 
-(trả lời ở đây)
+`idempotency.json` (trip `trip-00003`, 60 khung): bảng `silver.frames` trước có **1246 dòng**, dấu vân tay `6c7480dfde7e`; sau **hai lần chạy lại** partition đó vẫn **1246 dòng**, vân tay `6c7480dfde7e` (`unchanged: true`). Kiểu sai `append` chạy 2 lần cho trip này ra **120 dòng** cho 60 khung, tức **nhân đôi**. `cli history silver.frames` cho thấy hai lần chạy lại là hai commit mới (version 26, 27), mỗi commit `WRITE` với `predicate: trip_id = 'trip-00003'` và `rows_added: 60`: thay đúng partition đó, không đụng 25 trip còn lại.
+
+Delta `overwrite` theo predicate là **một giao dịch nguyên tử**: file mới được ghi xong rồi mới có một commit vào `_delta_log` vừa đánh dấu xoá file cũ của trip vừa thêm file mới. Nếu lỗi giữa chừng (sập lúc đang decode video, mất kết nối MinIO), commit không xảy ra, người đọc vẫn thấy **phiên bản cũ đầy đủ**, chạy lại là xong. Còn "xoá rồi ghi lại" là hai thao tác: sập sau khi xoá thì trip đó **mất dữ liệu**, và người đọc giữa hai thao tác thấy bảng thiếu. Ngoài ra bản cũ vẫn xem được bằng time travel.
 
 ### Câu 5
 Khung hình **đen** và khung hình **tối** khác nhau thế nào, pipeline xử lý khác nhau ra sao, bạn có đồng ý không? Dựa vào `threshold.json`: nếu chọn ngưỡng 0, 2, 6 thì bao nhiêu khung bị coi là trùng ở mỗi drive? Bạn chọn ngưỡng nào, vì sao, và ngưỡng đó phụ thuộc vào tốc độ xe thế nào?
 
 | dHash khác tối đa | số khung trùng, drive A | số khung trùng, drive B |
 |---|---|---|
-| 0 | | |
-| 2 | | |
-| 6 | | |
+| 0 | 61 / 602 | 8 / 644 |
+| 2 | 149 / 602 | 53 / 644 |
+| 6 | 363 / 602 | 244 / 644 |
 
-(trả lời ở đây)
+**Khung đen** (độ sáng trung bình < `dark_luma = 12`) là khung **hỏng**: camera/encoder lỗi, không có thông tin gì, nên bị **loại** khỏi gold (A 6, B 4). **Khung tối** (độ sáng < `dark_soft = 40` nhưng ≥ 12) là **điều kiện thật**: đường hầm, bóng râm, chiều tối; ảnh vẫn nhìn thấy đường, nên chỉ **gắn cờ và giữ lại** (A 4, B 61). Tôi đồng ý: mô hình xe tự lái phải học được cả cảnh thiếu sáng, bỏ khung tối sẽ làm dataset lệch về trời sáng; cờ vẫn cho phép lọc hoặc cân bằng lại sau. Ngưỡng cứng 12 có nhược điểm là một khung đêm rất tối nhưng vẫn có đèn có thể bị coi là đen.
+
+Ngưỡng trùng (`threshold.json`): 0 bit → A 61, B 8; 2 bit (đang dùng) → A 149, B 53; 6 bit → A 363, B 244 (hơn một nửa drive A). Tôi chọn **2**: đủ bắt camera đứng hình ở A (verify: 11/12 khung đứng hình bị bắt) và các khung xe gần như đứng yên, nhưng không loại khung thật sự khác nhau. Ở 6 bit, B (xe chạy nhanh, cảnh đổi liên tục) vẫn mất 244/644 khung, tức là đã loại cả khung có nội dung mới. Ngưỡng phụ thuộc tốc độ: A trung bình 38,1 km/h, 15,3% thời gian dưới 7 km/h nên hai khung cách nhau 0,5 s gần như giống nhau → nhiều trùng; B trung bình 70,6 km/h nên ít trùng. Xe càng chậm (hoặc lấy mẫu càng dày) thì khung liền kề càng giống, và một ngưỡng cố định sẽ loại nhiều hơn; hợp lý hơn là ngưỡng thấp kết hợp với tốc độ (ví dụ chỉ coi là trùng khi tốc độ gần 0 hoặc khi camera đứng hình).
 
 ## Bước 4 · Gold
 
