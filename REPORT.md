@@ -7,14 +7,14 @@
 | Họ và tên | Đỗ Đình Long |
 | MSSV (đúng bằng `LAB_STUDENT_ID` trong `.env`) | 2A202602673 |
 | GitHub | long2110d |
-| Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | `<điền: trip-xxxxx>` |
+| Trip dùng cho bài tập sập và chạy lại (xem GUIDE, bước 5) | trip-04868 (MSSV có chữ nên bỏ chữ "A": 202602673 mod 26 = 13 → phần tử chỉ số 13 (đếm từ 0) của `list-trips`; đã dùng đúng công thức trong GUIDE) |
 
 ## Kết quả cuối
 
-- `dataset_version` của bạn: `<điền>`  (phải khớp `report/evidence/run_summary.json`)
-- Số khung hình train / val / test của bạn: `<điền>`
-- `report/verify.txt`: tạo bằng `python3 scripts/check_submission.py --save-verify` (phải có `27/27 checks passed`).
-- Ảnh chụp trong `report/screenshots/`: `airflow_graph.png`, `minio_lake.png`, `metabase_dashboard.png`, và ảnh bài tập sập/chạy lại (log task đỏ thấy trip của bạn).
+- `dataset_version` của bạn: `fb6509ec3b13`  (phải khớp `report/evidence/run_summary.json`)
+- Số khung hình train / val / test của bạn: 786 / 108 / 125 (18 / 4 / 4 trip, tổng 1019 khung)
+- `report/verify.txt`: `27/27 checks passed` (trên Windows tạo bằng `bash scripts/lab.sh verify > report/verify.txt`, vì `--save-verify` gọi trực tiếp file `.sh`).
+- Ảnh chụp trong `report/screenshots/`: `airflow_graph.png`, `minio_lake.png`, `metabase_dashboard.png`, `airflow_crash_log.png` (log task đỏ, thấy `trip-04868`), `airflow_after_clear.png` (DAG xanh sau khi clear).
 
 ## Bước 1 · Bronze
 
@@ -116,21 +116,41 @@ Ba tháng sau, để tái tạo đúng dataset: (1) `dataset_version` + `manifes
 ### Câu 9
 Mô tả chính xác điều xảy ra khi trip của bạn sập rồi chạy lại: bao nhiêu task chuyển đỏ, bao nhiêu task `upstream_failed`, bạn clear gì, dữ liệu có nhân đôi không, `dataset_version` có đổi không? Bằng chứng (ảnh, số) là gì?
 
-(trả lời ở đây)
+Đặt `LAB_FAIL_ONCE=trip-04868`, trigger `day09_reset` rồi `day09_video_pipeline` (run `manual__2026-10-13T09:18:39`). Kết quả: **1 task đỏ**, là `silver_frames` map index 13, log `RuntimeError: simulated crash while extracting trip-04868; run it again` (`airflow_crash_log.png`). 25 task `silver_frames` còn lại **xanh**, vì mỗi trip là một task độc lập (dynamic task mapping). **7 task `upstream_failed`**: `dbt_run_silver`, `dbt_test_silver`, `dbt_run_gold`, `dbt_test_gold`, `publish_lake`, `export_dataset`, `publish_warehouse`; không có gì được publish khi thiếu một trip.
+
+Tôi **chỉ clear task đỏ đó** (kèm downstream mặc định). Task trip-04868 chạy lại ở lần thử 2 (Task Tries: 1 đỏ, 2 xanh) và 7 task sau chạy tiếp; **25 trip đã xong không chạy lại**. Kết thúc: run `success`, 37/37 task instance success (`airflow_after_clear.png`).
+
+Không nhân đôi: sau đó `verify` **27/27**, `silver.frames` có **1246 dòng, 1246 `frame_id` khác nhau**, trip-04868 có đúng **60 dòng**, commit Delta của trip là một `WRITE` với `predicate: trip_id = 'trip-04868'`. Lần thử 1 sập **trước khi** commit nên không để lại gì; lần thử 2 overwrite partition. `dataset_version` **không đổi**: vẫn `fb6509ec3b13`, giống lần chạy xanh và giống `step all`.
 
 ### Câu 10
 Nâng từ 2 drive lên **500 xe mỗi ngày**: ba thành phần nào của pipeline này sẽ vỡ đầu tiên, và bạn thay bằng gì (nối với slide 12, 22, 23)?
 
-(trả lời ở đây)
+Hiện tại: 2 drive × ~5 phút → 1246 khung, cả DAG ~3 phút trên một máy. 500 xe/ngày, mỗi xe ~8 giờ, 7 camera là khoảng **10⁵ lần** khối lượng này.
+
+1. **Decode video bằng FFmpeg trong worker Airflow** (một container, `LocalExecutor`, mỗi trip một task chạy tuần tự vài giây). Đây là nút cổ chai lớn nhất (slide 24): CPU decode không theo kịp hàng nghìn giờ video mỗi ngày. Thay bằng một cụm xử lý riêng: decode bằng GPU (NVDEC / DALI) chạy trên Spark/Ray hoặc Kubernetes job, autoscale theo hàng đợi; Airflow chỉ **điều phối**, không tự xử lý dữ liệu. Ingest chuyển sang dạng sự kiện (xe upload lên object storage, sự kiện vào hàng đợi Kafka/SQS), không đợi batch.
+2. **DuckDB + dbt chạy trên một tiến trình** để biến đổi và test. DuckDB đọc Delta trên một máy, bộ nhớ có hạn, không chạy song song nhiều người ghi. Thay bằng engine phân tán (Spark/Databricks, Trino) trên cùng bảng Delta/Iceberg; vẫn giữ dbt làm lớp mô hình và test (dbt-spark), partition theo `date/vehicle_id` thay vì theo trip.
+3. **Lưu trữ và mô hình bảng**: MinIO một node, `silver.frames` ghi mỗi partition một commit (26 trip đã là 26 commit, lineage của tôi thấy `silver.frames` version 27) và mỗi khung là một file JPEG nhỏ. Ở quy mô lớn sẽ có hàng triệu file nhỏ và hàng chục nghìn commit/ngày. Thay bằng S3/object storage nhiều node, gộp commit (ghi theo lô, `OPTIMIZE`/compaction), lưu khung trong định dạng gói (WebDataset/tar shard, Parquet chứa ảnh), chỉ trích khung khi cần. Postgres + Metabase cho mart cũng nên chuyển sang warehouse dạng cột (BigQuery/Snowflake/ClickHouse) khi bảng gallery lên hàng trăm triệu dòng.
 
 ## Câu hỏi riêng của bạn trên Metabase
 
 Câu SQL bạn thêm vào dashboard và điều nó cho biết:
 
-(trả lời ở đây)
+Thẻ "Câu hỏi riêng: tỷ lệ khung bị loại theo trip" trên dashboard *Day 9: video data pipeline* (database `warehouse`):
+
+```sql
+select trip_id, drive_id, frames, frames_kept,
+       round(100.0*(frames-frames_kept)/frames,1) as pct_rejected,
+       avg_speed_kmh, split
+from marts.mart_trip_summary
+order by pct_rejected desc
+```
+
+Kết quả (8 trip đầu): trip-04622 (A) **56,7%** (60 → 26 khung), trip-03904 (A) 50%, trip-02086 (A) 46,7%, trip-08888 (A) 40%, trip-07774 (A) 38,2%, trip-06570 (A) 28,9%, trip-04871 (B) 28,3%, trip-08448 (B) 25%. **6/8 trip tệ nhất thuộc drive A.** Tra thêm trong `silver_frame_telemetry`: các trip này bị loại gần như chỉ vì **khung trùng** (trip-04622: 34 trùng, 0 đen/mờ/lệch; trip-02086: 28; trip-08888: 24), khớp với tốc độ thấp (trip-08888 6,5 km/h, trip-02086 17,6 km/h). Ý nghĩa vận hành: drive A mất nhiều dữ liệu nhất vì lọc trùng chứ không phải vì lỗi camera, và vì cả trip-02086, trip-04622 nằm ở train, tập train thiếu cảnh tốc độ thấp. Điểm lạ: trip-04622 chạy trung bình 67,1 km/h mà vẫn bị loại 56,7% → có thể là dHash coi nhầm cảnh đường cao tốc đơn điệu là trùng (xem "Nhìn lại").
 
 ## Nhìn lại
 
 Điều bạn thấy bất ngờ nhất, điều gì còn chưa rõ, và một lỗi dữ liệu mà bạn nghĩ pipeline **chưa** bắt được (nếu có). Tối đa 8 dòng.
 
-(trả lời ở đây)
+- **Bất ngờ nhất**: chia theo khung hình làm rò rỉ **cả 26/26 trip**, không phải "một vài"; và một task sập chỉ cần chạy lại đúng một partition, còn dữ liệu không nhân đôi, nhờ Delta overwrite theo predicate.
+- **Chưa rõ**: `max_gap_ms` chỉ `warn`, nhưng nếu một ngày cảm biến mất tín hiệu 50% thời gian thì vẫn chỉ là warn; tôi chưa rõ nên đặt ngưỡng nào để warn chuyển thành error (ví dụ theo tỷ lệ khung `mat_dong_bo`, đang là 7 + 7).
+- **Lỗi pipeline có thể chưa bắt đúng**: (1) trip-04622 đi 67 km/h nhưng 34/60 khung bị coi là trùng. dHash 64 bit trên ảnh thu nhỏ dễ coi hai khung đường cao tốc khác nhau là "gần giống", tức là **loại nhầm** dữ liệu tốt; nên kết hợp tốc độ/GPS (xe đang chạy nhanh thì khó trùng). (2) Pipeline không kiểm tra telemetry có **khớp nội dung** video không: nếu offset khai báo trong `sources.json` sai (ví dụ 1500 thay vì 2500 ms) thì join vẫn "đồng bộ" trong 150 ms và mọi test vẫn PASS. (3) Môi trường: trên Windows phải đổi script `.sh` sang LF và đặt `MSYS_NO_PATHCONV=1` thì `lab.sh` mới chạy.
